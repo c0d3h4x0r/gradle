@@ -149,6 +149,7 @@ public class SocketConnection<T> implements RemoteConnection<T> {
         private final ByteBuffer buffer;
         private final SocketChannel socket;
         private final byte[] readBuffer = new byte[1];
+        private static final int MAX_SECONDS = 60;
 
         public SocketInputStream(SocketChannel socket) throws IOException {
             this.socket = socket;
@@ -175,11 +176,40 @@ public class SocketConnection<T> implements RemoteConnection<T> {
 
             if (buffer.remaining() == 0) {
                 try {
-                    selector.select();
+                    // selector.select() with no timeout can hang the build!  Instead,
+                    // retry for up to MAX_SECONDS, then move on with life.
+                    long next_sleep_ms = 1;
+                    long total_slept_ms = 0;
+                    int selected_keys = 0;
+                    while (true) {
+                        if (!selector.isOpen()) {
+                            return -1;
+                        }
+                        selected_keys = selector.select(next_sleep_ms);
+                        if (!selector.isOpen()) {
+                            return -1;
+                        }
+                        if (selected_keys > 0) {
+                            break;
+                        }
+                        // There is a bug in the JRE (hit only occasionally) in which selector.select()
+                        // doesn't block for the specified timeout anymore, effectively creating a busy loop.
+                        // The fix is to make the loop non-busy by explicitly sleeping (using exponential
+                        // backoff) each time there's no data in the socket.
+                        try {
+                            Thread.sleep(next_sleep_ms);
+                        } catch (InterruptedException e) {
+                            continue; // try again
+                        }
+                        total_slept_ms += next_sleep_ms;
+                        if (total_slept_ms > MAX_SECONDS * 1000) {
+                            return -1;
+                        }
+                        next_sleep_ms *= 2;
+                    }
                 } catch (ClosedSelectorException e) {
                     return -1;
-                }
-                if (!selector.isOpen()) {
+                } catch (IOException e) {
                     return -1;
                 }
 
